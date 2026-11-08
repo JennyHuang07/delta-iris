@@ -4,22 +4,24 @@
 # Check status:                squeue -u $USER
 # Follow the log:              tail -f slurm-delta-iris-fl-<jobid>.out   (ignored by .gitignore)
 #
-# TODO: fill in partition / account / qos according to the lab's Skynet guide (HCAI-Lab-GT/skynet).
+# ei-lab partition: max 4h per job, not preempted. timing.csv is written after every epoch,
+# so if the job hits the 4h limit, all finished epochs are still logged.
 
 #SBATCH --job-name=delta-iris-fl
 #SBATCH --output=slurm-%x-%j.out
 #SBATCH --error=slurm-%x-%j.out
-#SBATCH --partition=<PARTITION>
-#SBATCH --account=<ACCOUNT>
-#SBATCH --qos=<QOS>
+#SBATCH --partition=ei-lab
+#SBATCH --account=ei-lab
+#SBATCH --qos=short
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8          # 4 DataLoader workers + 16 env processes are light; 8 cores is plenty
 #SBATCH --mem=32G
-#SBATCH --time=12:00:00
+#SBATCH --time=4:00:00             # ei-lab partition limit
 
-set -euo pipefail
+set -eo pipefail   # no -u: conda's activation scripts reference unset variables
 
-source ~/.bashrc
+# Load conda directly: ~/.bashrc returns early in non-interactive (batch) shells, so `conda init` has no effect here
+source $HOME/miniforge3/etc/profile.d/conda.sh
 conda activate delta-iris
 
 # Record the hardware so timing numbers can be interpreted later
