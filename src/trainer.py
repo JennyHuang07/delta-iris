@@ -1,4 +1,6 @@
 from collections import defaultdict
+from contextlib import contextmanager, nullcontext
+import csv
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -25,6 +27,33 @@ from models import ActorCritic, Tokenizer, WorldModel
 from utils import configure_optimizer, EpisodeDirManager, plot_counts, set_seed, try_until_no_except
 
 
+class PhaseTimer:
+    """Wall-clock timer for the phases of one epoch.
+
+    CUDA kernels run asynchronously, so we call torch.cuda.synchronize() at the start and end of each phase.
+    Otherwise GPU work launched in one phase could be counted in the next one. We only sync at phase
+    boundaries (a few times per epoch), so this has no measurable cost.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.times = defaultdict(float)  # phase name -> seconds
+
+    def _sync(self) -> None:
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize(self.device)
+
+    @contextmanager
+    def __call__(self, name: str):
+        self._sync()
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._sync()
+            self.times[name] += time.perf_counter() - start
+
+
 class Trainer:
     def __init__(self, cfg: DictConfig) -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -39,6 +68,7 @@ class Trainer:
         self.cfg = cfg
         self.device = torch.device(cfg.common.device)
         self.start_epoch = 1
+        self.grad_steps = {}
 
         self.make_dirs()
 
@@ -109,39 +139,85 @@ class Trainer:
         return num_actions
 
     def run(self) -> None:
+        run_start_time = time.perf_counter()
+        steps_at_start = self.train_dataset.num_steps if self.cfg.training.should else 0
+
         for epoch in range(self.start_epoch, 1 + self.cfg.common.epochs):
 
             print(f"\nEpoch {epoch} / {self.cfg.common.epochs}\n")
             start_time = time.time()
             to_log = []
+            timer = PhaseTimer(self.device)
 
             if self.cfg.training.should:
                 if self.cfg.collection.path_to_static_dataset is None and epoch <= self.cfg.collection.train.stop_after_epochs:
-                    to_log += self.train_collector.collect(self.agent, epoch, **self.cfg.collection.train.config)
-                to_log += self.train_agent(epoch)
+                    with timer('collect_train'):
+                        to_log += self.train_collector.collect(self.agent, epoch, **self.cfg.collection.train.config)
+                to_log += self.train_agent(epoch, timer)
 
             if self.cfg.evaluation.should and (epoch % self.cfg.evaluation.every == 0):
                 if self.cfg.collection.path_to_static_dataset is None:
-                    self.test_dataset.clear()
-                    to_log += self.test_collector.collect(self.agent, epoch, **self.cfg.collection.test.config, offset_episode_id=(epoch - 1) // self.cfg.evaluation.every  * self.cfg.collection.test.config.num_episodes)
-                    self.test_dataset.save_info()
-                to_log += self.eval_agent(epoch)
+                    with timer('collect_test'):
+                        self.test_dataset.clear()
+                        to_log += self.test_collector.collect(self.agent, epoch, **self.cfg.collection.test.config, offset_episode_id=(epoch - 1) // self.cfg.evaluation.every  * self.cfg.collection.test.config.num_episodes)
+                        self.test_dataset.save_info()
+                with timer('eval'):
+                    to_log += self.eval_agent(epoch)
 
             if self.cfg.training.should:
-                self.save_checkpoint(epoch, save_agent_only=not self.cfg.common.do_checkpoint)
+                with timer('checkpoint'):
+                    self.save_checkpoint(epoch, save_agent_only=not self.cfg.common.do_checkpoint)
                 if epoch == self.cfg.common.epochs:
                     to_log.append({'sampling_counts_tokenizer': wandb.Image(plot_counts(self.episode_count_manager.all_counts['tokenizer']))})
                     to_log.append({'sampling_counts_world_model': wandb.Image(plot_counts(self.episode_count_manager.all_counts['world_model']))})
                     to_log.append({'sampling_counts_actor_critic': wandb.Image(plot_counts(self.episode_count_manager.all_counts['actor_critic']))})
 
             to_log.append({'duration': (time.time() - start_time) / 3600})
+            to_log.append(self.log_timing(epoch, timer, time.time() - start_time, time.perf_counter() - run_start_time, steps_at_start))
 
             for d in to_log:
                 wandb.log({'epoch': epoch, **d})
 
         self.finish()
 
-    def train_agent(self, epoch: int) -> None:
+    def log_timing(self, epoch: int, timer: PhaseTimer, epoch_seconds: float, total_seconds: float, steps_at_start: int) -> Dict[str, float]:
+        """Print a per-phase timing table, append it to timing.csv (in the run folder), and return it for wandb."""
+        num_env_steps = self.train_dataset.num_steps if self.cfg.training.should else 0
+        new_env_steps = num_env_steps - steps_at_start
+
+        row = {
+            'epoch': epoch,
+            **{f'time/{k}': v for k, v in timer.times.items()},
+            'time/epoch': epoch_seconds,
+            'time/total': total_seconds,
+            'time/num_env_steps': num_env_steps,
+            # same definition as the paper's Table 1: environment frames collected / training duration
+            'time/fps': new_env_steps / total_seconds if total_seconds > 0 else 0.0,
+        }
+        for name in ('tokenizer', 'world_model', 'actor_critic'):
+            if name in self.grad_steps and self.grad_steps[name] > 0:
+                row[f'time/{name}_ms_per_step'] = 1000 * timer.times[f'train_{name}'] / self.grad_steps[name]
+
+        print(f"\n[timing] epoch {epoch}: {epoch_seconds:.1f}s this epoch, {total_seconds / 3600:.2f}h total, fps={row['time/fps']:.1f}")
+        for k, v in timer.times.items():
+            ms_key = 'time/' + k.replace('train_', '', 1) + '_ms_per_step'
+            extra = f'  ({row[ms_key]:.1f} ms/step)' if ms_key in row else ''
+            print(f'[timing]   {k:<22s} {v:9.1f}s  {100 * v / epoch_seconds:5.1f}%{extra}')
+
+        csv_path = Path('timing.csv')
+        fieldnames = ['epoch', 'time/collect_train', 'time/train_tokenizer', 'time/train_world_model', 'time/train_actor_critic',
+                      'time/collect_test', 'time/eval', 'time/checkpoint', 'time/epoch', 'time/total', 'time/num_env_steps', 'time/fps',
+                      'time/tokenizer_ms_per_step', 'time/world_model_ms_per_step', 'time/actor_critic_ms_per_step']
+        is_new = not csv_path.exists()
+        with csv_path.open('a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            if is_new:
+                writer.writeheader()
+            writer.writerow(row)
+
+        return row
+
+    def train_agent(self, epoch: int, timer: PhaseTimer) -> None:
         self.agent.train()
         self.agent.zero_grad()
 
@@ -157,40 +233,49 @@ class Trainer:
         if epoch == 1 and cfg_world_model.steps_first_epoch is not None:
             cfg_world_model.steps_per_epoch = cfg_world_model.steps_first_epoch
 
+        self.grad_steps = {}  # component name -> number of gradient steps this epoch (for ms/step timing)
+
         if epoch > cfg_tokenizer.start_after_epochs:
-            to_log_tokenizer = self.train_component(
-                self.agent.tokenizer,
-                self.optimizer_tokenizer,
-                can_sample_beyond_end=True,
-                should_update_counts=(epoch > 1),
-                use_mixed_precision=True,
-                **cfg_tokenizer
-            )
+            with timer('train_tokenizer'):
+                to_log_tokenizer = self.train_component(
+                    self.agent.tokenizer,
+                    self.optimizer_tokenizer,
+                    can_sample_beyond_end=True,
+                    should_update_counts=(epoch > 1),
+                    use_mixed_precision=True,
+                    **cfg_tokenizer
+                )
+            self.grad_steps['tokenizer'] = cfg_tokenizer.steps_per_epoch
         self.agent.tokenizer.eval()
 
         if epoch > cfg_world_model.start_after_epochs:
-            to_log_world_model = self.train_component(
-                self.agent.world_model,
-                self.optimizer_world_model,
-                can_sample_beyond_end=True,
-                tokenizer=self.agent.tokenizer,
-                should_update_counts=(epoch > 1),
-                use_mixed_precision=True,
-                **cfg_world_model
-            )
+            with timer('train_world_model'):
+                to_log_world_model = self.train_component(
+                    self.agent.world_model,
+                    self.optimizer_world_model,
+                    can_sample_beyond_end=True,
+                    tokenizer=self.agent.tokenizer,
+                    should_update_counts=(epoch > 1),
+                    use_mixed_precision=True,
+                    **cfg_world_model
+                )
+            self.grad_steps['world_model'] = cfg_world_model.steps_per_epoch
         self.agent.world_model.eval()
 
+        # Actor-critic training = imagination rollouts in the world model (expected bottleneck: autoregressive Delta-token sampling)
         if epoch > cfg_actor_critic.start_after_epochs:
-            to_log_actor_critic = self.train_component(
-                self.agent.actor_critic,
-                self.optimizer_actor_critic,
-                can_sample_beyond_end=False,
-                should_update_counts=(epoch > 1),
-                use_mixed_precision=False,
-                tokenizer=self.agent.tokenizer,
-                world_model=self.agent.world_model,
-                **cfg_actor_critic
-            )
+            with timer('train_actor_critic'):
+                to_log_actor_critic = self.train_component(
+                    self.agent.actor_critic,
+                    self.optimizer_actor_critic,
+                    can_sample_beyond_end=False,
+                    should_update_counts=(epoch > 1),
+                    use_mixed_precision=False,
+                    tokenizer=self.agent.tokenizer,
+                    world_model=self.agent.world_model,
+                    **cfg_actor_critic
+                )
+            self.grad_steps['actor_critic'] = cfg_actor_critic.steps_per_epoch
         self.agent.actor_critic.eval()
 
         return to_log_tokenizer, to_log_world_model, to_log_actor_critic
@@ -213,14 +298,18 @@ class Trainer:
 
         batch_sampler = BatchSampler(self.train_dataset, steps_per_epoch * grad_acc_steps, batch_num_samples, sequence_length, can_sample_beyond_end) 
         batch_sampler.probabilities = self.episode_count_manager.compute_probabilities(key=str(component), alpha=priority_alpha)
+        use_cuda = self.device.type == 'cuda'
         loader = DataLoader(
             self.train_dataset,
             batch_sampler=batch_sampler,
-            num_workers=4,
+            num_workers=self.cfg.training.get('num_workers', 4),
             collate_fn=collate_segments_to_batch,
-            pin_memory=True,
-            pin_memory_device=str(self.device)
+            pin_memory=use_cuda,  # pinned memory only helps (and only works) for CPU -> GPU copies
+            pin_memory_device=str(self.device) if use_cuda else ''
         ) # DataLoader preloads batches, so counts are slightly lagging behind.
+
+        # bf16 autocast is meant for GPU; on CPU (local debugging, e.g. a Mac) it is slow or unsupported, so use fp32 there
+        use_mixed_precision = use_mixed_precision and use_cuda
 
         to_log = defaultdict(float)
         optimizer.zero_grad()
@@ -229,7 +318,9 @@ class Trainer:
             for i, batch in enumerate(loader):
                 
                 batch = batch.to(self.device)
-                with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16 if use_mixed_precision else torch.float32):
+                # GPU: unchanged from the original code. CPU: no autocast (CPU autocast only accepts bf16)
+                autocast_ctx = torch.autocast(device_type='cuda', dtype=torch.bfloat16 if use_mixed_precision else torch.float32) if use_cuda else nullcontext()
+                with autocast_ctx:
                     losses, metrics = component.compute_loss(batch, **kwargs_loss)
                 loss = losses.loss_total / grad_acc_steps
                 loss.backward()

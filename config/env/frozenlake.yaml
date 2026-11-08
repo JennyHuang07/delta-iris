@@ -1,0 +1,10 @@
+train:
+  _target_: envs.make_frozenlake
+  map_name: 4x4          # 4x4 or 8x8 (size must be divisible by the grid: 64 works for both)
+  is_slippery: true      # stochastic transitions -> what Delta-tokens are supposed to encode
+  size: 64               # frame resolution expected by the tokenizer (params.tokenizer.image_size)
+  max_episode_steps: 100
+
+test: ${.train}
+
+keymap: frozenlake

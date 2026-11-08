@@ -16,6 +16,9 @@ def get_keymap_and_action_names(name):
     if name == 'atari':
         return ATARI_KEYMAP, ATARI_ACTION_NAMES
 
+    if name == 'frozenlake':
+        return FROZENLAKE_KEYMAP, FROZENLAKE_ACTION_NAMES
+
     assert name.startswith('atari/')
     env_id = name.split('atari/')[1]
     action_names = [x.lower() for x in gym.make(env_id).get_action_meanings()]
@@ -110,6 +113,20 @@ CRAFTER_KEYMAP = {
     pygame.K_4: 14,
     pygame.K_5: 15,
     pygame.K_6: 16,
+}
+
+FROZENLAKE_ACTION_NAMES = [
+    'left',
+    'down',
+    'right',
+    'up',
+]
+
+FROZENLAKE_KEYMAP = {
+    pygame.K_a: 0,
+    pygame.K_s: 1,
+    pygame.K_d: 2,
+    pygame.K_w: 3,
 }
 
 EPISODE_REPLAY_ACTION_NAMES = [
