@@ -24,6 +24,9 @@ set -eo pipefail   # no -u: conda's activation scripts reference unset variables
 source $HOME/miniforge3/etc/profile.d/conda.sh
 conda activate delta-iris
 
+# Flush Python output immediately so the Slurm log (and `tail -f`) shows progress live instead of in delayed chunks
+export PYTHONUNBUFFERED=1
+
 # Record the hardware so timing numbers can be interpreted later
 echo "host: $(hostname)"
 nvidia-smi
