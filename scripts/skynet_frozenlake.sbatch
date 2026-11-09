@@ -13,7 +13,7 @@
 #SBATCH --partition=ei-lab
 #SBATCH --account=ei-lab
 #SBATCH --qos=short
-#SBATCH --gpus-per-node=1
+#SBATCH --gres=gpu:a40:1           # needs a bf16-capable GPU (Ampere or newer: a40 / a5000 / l40s). rtx_6000, 2080_ti, titan_x do NOT support bf16
 #SBATCH --cpus-per-task=8          # 4 DataLoader workers + 16 env processes are light; 8 cores is plenty
 #SBATCH --mem=32G
 #SBATCH --time=4:00:00             # ei-lab partition limit
@@ -30,7 +30,7 @@ export PYTHONUNBUFFERED=1
 # Record the hardware so timing numbers can be interpreted later
 echo "host: $(hostname)"
 nvidia-smi
-python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'gpu', torch.cuda.get_device_name(0))"
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'gpu', torch.cuda.get_device_name(0), 'bf16', torch.cuda.is_bf16_supported())"
 
 # wandb: use online if the compute node has internet, otherwise offline and `wandb sync` later from the login node
 python src/main.py env=frozenlake params=frozenlake \
